@@ -14,43 +14,58 @@ from datasets.utils import build_data_loader
 import clip
 from utils import *
 
+from blip.models.blip import blip_feature_extractor
+
 
 def get_arguments():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', dest='config', help='settings of Tip-Adapter in yaml format')
+    parser.add_argument('--use_blip', default=False, action="store_true", help='whether to use blip model')
     args = parser.parse_args()
 
     return args
 
 
-def run_tip_adapter(cfg, cache_keys, cache_values, val_features, val_labels, test_features, test_labels, clip_weights):
+def run_tip_adapter(cfg, cache_keys, cache_values, val_features, val_labels, test_features, test_labels, clip_weights, blip_model=None, blip_weights=None):
     
     print("\n-------- Searching hyperparameters on the val set. --------")
 
     # Zero-shot CLIP
-    clip_logits = 100. * val_features @ clip_weights
+    clip_logits = 100. * val_features[:, :1024] @ clip_weights  # 由于concat，前1024维是clip的image feature
+    print(clip_logits)
     acc = cls_acc(clip_logits, val_labels)
     print("\n**** Zero-shot CLIP's val accuracy: {:.2f}. ****\n".format(acc))
 
     # Tip-Adapter
     beta, alpha = cfg['init_beta'], cfg['init_alpha']
+    gamma = cfg['init_gamma']
     
+    # print(cache_keys.shape)
     affinity = val_features @ cache_keys
     cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
-    
-    tip_logits = clip_logits + cache_logits * alpha
+
+    if blip_weights is not None:
+        # print(val_features[:,1024:].shape)
+        # print(blip_weights.shape)
+        blip_logits = 100. * val_features[:, 1024:] @ blip_weights
+        print(blip_logits[0])
+        acc = cls_acc(blip_logits, val_labels)
+        print("\n**** Zero-shot BLIP's val accuracy: {:.2f}. ****\n".format(acc))
+        tip_logits = (blip_logits * (1-gamma) + clip_logits * gamma) + cache_logits * alpha
+    else:
+        tip_logits = clip_logits + cache_logits * alpha
     acc = cls_acc(tip_logits, val_labels)
     print("**** Tip-Adapter's val accuracy: {:.2f}. ****\n".format(acc))
 
     # Search Hyperparameters
-    best_beta, best_alpha = search_hp(cfg, cache_keys, cache_values, val_features, val_labels, clip_weights)
+    best_beta, best_alpha, best_gamma = search_hp(cfg, cache_keys, cache_values, val_features, val_labels, clip_weights, blip_weights=blip_weights)
 
 
     print("\n-------- Evaluating on the test set. --------")
 
     # Zero-shot CLIP
-    clip_logits = 100. * test_features @ clip_weights
+    clip_logits = 100. * test_features[:, :1024] @ clip_weights
     acc = cls_acc(clip_logits, test_labels)
     print("\n**** Zero-shot CLIP's test accuracy: {:.2f}. ****\n".format(acc))
 
@@ -58,12 +73,18 @@ def run_tip_adapter(cfg, cache_keys, cache_values, val_features, val_labels, tes
     affinity = test_features @ cache_keys
     cache_logits = ((-1) * (best_beta - best_beta * affinity)).exp() @ cache_values
     
-    tip_logits = clip_logits + cache_logits * best_alpha
+    if blip_weights is not None:
+        blip_logits = test_features[:, 1024:] @ blip_weights
+        acc = cls_acc(blip_logits, test_labels)
+        print("\n**** Zero-shot BLIP's test accuracy: {:.2f}. ****\n".format(acc))
+        tip_logits = (blip_logits * (1-gamma) + clip_logits * gamma) + cache_logits * alpha
+    else:
+        tip_logits = clip_logits + cache_logits * alpha
     acc = cls_acc(tip_logits, test_labels)
     print("**** Tip-Adapter's test accuracy: {:.2f}. ****\n".format(acc))
 
 
-def run_tip_adapter_F(cfg, cache_keys, cache_values, val_features, val_labels, test_features, test_labels, clip_weights, clip_model, train_loader_F):
+def run_tip_adapter_F(cfg, cache_keys, cache_values, val_features, val_labels, test_features, test_labels, clip_weights, clip_model, train_loader_F, blip_model=None, blip_weights=None):
     
     # Enable the cached keys to be learnable
     adapter = nn.Linear(cache_keys.shape[0], cache_keys.shape[1], bias=False).to(clip_model.dtype).cuda()
@@ -73,6 +94,7 @@ def run_tip_adapter_F(cfg, cache_keys, cache_values, val_features, val_labels, t
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, cfg['train_epoch'] * len(train_loader_F))
     
     beta, alpha = cfg['init_beta'], cfg['init_alpha']
+    gamma = cfg['init_gamma']
     best_acc, best_epoch = 0.0, 0
 
     for train_idx in range(cfg['train_epoch']):
@@ -87,11 +109,20 @@ def run_tip_adapter_F(cfg, cache_keys, cache_values, val_features, val_labels, t
             with torch.no_grad():
                 image_features = clip_model.encode_image(images)
                 image_features /= image_features.norm(dim=-1, keepdim=True)
+                if blip_model:
+                    blip_img_features = blip_model(images, caption=None, mode='image')[:,0,:].squeeze().half()
+                    blip_img_features /= blip_img_features.norm(dim=-1, keepdim=True)
+                    image_features = torch.cat([image_features, blip_img_features], dim=1)
 
             affinity = adapter(image_features)
             cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
-            clip_logits = 100. * image_features @ clip_weights
-            tip_logits = clip_logits + cache_logits * alpha
+            clip_logits = 100. * image_features[:, :1024] @ clip_weights
+
+            if blip_weights is not None:
+                blip_logits = 100. * image_features[:, 1024:] @ blip_weights
+                tip_logits = (blip_logits * (1-gamma) + clip_logits * gamma) + cache_logits * alpha
+            else:
+                tip_logits = clip_logits + cache_logits * alpha
 
             loss = F.cross_entropy(tip_logits, target)
 
@@ -113,8 +144,12 @@ def run_tip_adapter_F(cfg, cache_keys, cache_values, val_features, val_labels, t
 
         affinity = adapter(test_features)
         cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
-        clip_logits = 100. * test_features @ clip_weights
-        tip_logits = clip_logits + cache_logits * alpha
+        clip_logits = 100. * test_features[:, :1024] @ clip_weights
+        if blip_weights is not None:
+            blip_logits = 100. * test_features[:, 1024:] @ blip_weights
+            tip_logits = (blip_logits * (1-gamma) + clip_logits * gamma) + cache_logits * alpha
+        else:
+            tip_logits = clip_logits + cache_logits * alpha
         acc = cls_acc(tip_logits, test_labels)
 
         print("**** Tip-Adapter-F's test accuracy: {:.2f}. ****\n".format(acc))
@@ -129,7 +164,7 @@ def run_tip_adapter_F(cfg, cache_keys, cache_values, val_features, val_labels, t
     print("\n-------- Searching hyperparameters on the val set. --------")
 
     # Search Hyperparameters
-    best_beta, best_alpha = search_hp(cfg, cache_keys, cache_values, val_features, val_labels, clip_weights, adapter=adapter)
+    best_beta, best_alpha, best_gamma = search_hp(cfg, cache_keys, cache_values, val_features, val_labels, clip_weights, adapter=adapter, blip_weights=blip_weights)
 
     print("\n-------- Evaluating on the test set. --------")
    
@@ -143,65 +178,81 @@ def run_tip_adapter_F(cfg, cache_keys, cache_values, val_features, val_labels, t
 
 def main():
 
-    # Load config file
-    args = get_arguments()
-    assert (os.path.exists(args.config))
-    
-    cfg = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
+    for shots in [2, 1]:
+        print(f'---------------------- {shots} shots -----------------------------')
 
-    cache_dir = os.path.join('./caches', cfg['dataset'])
-    os.makedirs(cache_dir, exist_ok=True)
-    cfg['cache_dir'] = cache_dir
+        # Load config file
+        args = get_arguments()
+        assert (os.path.exists(args.config))
+        
+        cfg = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
 
-    print("\nRunning configs.")
-    print(cfg, "\n")
+        cache_dir = os.path.join('./caches', cfg['dataset'])
+        os.makedirs(cache_dir, exist_ok=True)
+        cfg['cache_dir'] = cache_dir
 
-    # CLIP
-    clip_model, preprocess = clip.load(cfg['backbone'])
-    clip_model.eval()
+        print("\nRunning configs.")
+        print(cfg, "\n")
 
-    # Prepare dataset
-    random.seed(1)
-    torch.manual_seed(1)
-    
-    print("Preparing dataset.")
-    dataset = build_dataset(cfg['dataset'], cfg['root_path'], cfg['shots'])
+        # CLIP
+        clip_model, preprocess = clip.load(cfg['backbone'])
+        clip_model.eval()
 
-    val_loader = build_data_loader(data_source=dataset.val, batch_size=64, is_train=False, tfm=preprocess, shuffle=False)
-    test_loader = build_data_loader(data_source=dataset.test, batch_size=64, is_train=False, tfm=preprocess, shuffle=False)
+        # Prepare dataset
+        random.seed(1)
+        torch.manual_seed(1)
+        
+        print("Preparing dataset.")
+        dataset = build_dataset(cfg['dataset'], cfg['root_path'], shots)#cfg['shots'])
 
-    train_tranform = transforms.Compose([
-        transforms.RandomResizedCrop(size=224, scale=(0.5, 1), interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
-    ])
+        val_loader = build_data_loader(data_source=dataset.val, batch_size=64, is_train=False, tfm=preprocess, shuffle=False)
+        test_loader = build_data_loader(data_source=dataset.test, batch_size=64, is_train=False, tfm=preprocess, shuffle=False)
 
-    train_loader_cache = build_data_loader(data_source=dataset.train_x, batch_size=256, tfm=train_tranform, is_train=True, shuffle=False)
-    train_loader_F = build_data_loader(data_source=dataset.train_x, batch_size=256, tfm=train_tranform, is_train=True, shuffle=True)
+        train_tranform = transforms.Compose([
+            transforms.RandomResizedCrop(size=224, scale=(0.5, 1), interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711))
+        ])
 
-    # Textual features
-    print("\nGetting textual features as CLIP's classifier.")
-    clip_weights = clip_classifier(dataset.classnames, dataset.template, clip_model)
+        train_loader_cache = build_data_loader(data_source=dataset.train_x, batch_size=256, tfm=train_tranform, is_train=True, shuffle=False)
+        train_loader_F = build_data_loader(data_source=dataset.train_x, batch_size=256, tfm=train_tranform, is_train=True, shuffle=True)
 
-    # Construct the cache model by few-shot training set
-    print("\nConstructing cache model by few-shot visual features and labels.")
-    cache_keys, cache_values = build_cache_model(cfg, clip_model, train_loader_cache)
+        # blip model initialization
+        blip_model = None
+        blip_weights = None
+        if args.use_blip:
+            model_url = './blip/model_large.pth'
+            blip_model = blip_feature_extractor(pretrained=model_url, image_size=224, vit='large')
+            blip_model.eval()
+            blip_model = blip_model.cuda()
+            # blip_weights = None
+            # blip_weights = blip_classifier(dataset.classnames, dataset.template, blip_model)
 
-    # Pre-load val features
-    print("\nLoading visual features and labels from val set.")
-    val_features, val_labels = pre_load_features(cfg, "val", clip_model, val_loader)
+        # Textual features
+        print("\nGetting textual features as CLIP's classifier.")
+        clip_weights = clip_classifier(dataset.classnames, dataset.template, clip_model, blip_model=None)
 
-    # Pre-load test features
-    print("\nLoading visual features and labels from test set.")
-    test_features, test_labels = pre_load_features(cfg, "test", clip_model, test_loader)
+        # Construct the cache model by few-shot training set
+        print("\nConstructing cache model by few-shot visual features and labels.")
 
-    # ------------------------------------------ Tip-Adapter ------------------------------------------
-    run_tip_adapter(cfg, cache_keys, cache_values, val_features, val_labels, test_features, test_labels, clip_weights)
+        cache_keys, cache_values = build_cache_model(cfg, clip_model, train_loader_cache, blip_model=blip_model)
 
-    # ------------------------------------------ Tip-Adapter-F ------------------------------------------
-    run_tip_adapter_F(cfg, cache_keys, cache_values, val_features, val_labels, test_features, test_labels, clip_weights, clip_model, train_loader_F)
-           
+        # Pre-load val features
+        print("\nLoading visual features and labels from val set.")
+        val_features, val_labels = pre_load_features(cfg, "val", clip_model, val_loader, blip_model=blip_model)
+
+        # Pre-load test features
+        print("\nLoading visual features and labels from test set.")
+        test_features, test_labels = pre_load_features(cfg, "test", clip_model, test_loader, blip_model=blip_model)
+
+        # ------------------------------------------ Tip-Adapter ------------------------------------------
+        run_tip_adapter(cfg, cache_keys, cache_values, val_features, val_labels, test_features, test_labels, clip_weights, blip_model=None, blip_weights=blip_weights)
+
+        # ------------------------------------------ Tip-Adapter-F ------------------------------------------
+        run_tip_adapter_F(cfg, cache_keys, cache_values, val_features, val_labels, test_features, test_labels, clip_weights, clip_model, train_loader_F, blip_model=blip_model, blip_weights=blip_weights)
+        
+        print(f'---------------------- {shots} shots -----------------------------')
 
 if __name__ == '__main__':
     main()

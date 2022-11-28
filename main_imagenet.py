@@ -12,11 +12,13 @@ from datasets.imagenet import ImageNet
 import clip
 from utils import *
 
+from blip.models.blip import blip_feature_extractor
 
 def get_arguments():
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', dest='config', help='settings of Tip-Adapter in yaml format')
+    parser.add_argument('--use_blip', default=False, action="store_true", help='whether to use blip model')
     args = parser.parse_args()
 
     return args
@@ -25,7 +27,7 @@ def get_arguments():
 def run_tip_adapter(cfg, cache_keys, cache_values, test_features, test_labels, clip_weights):
     
     # Zero-shot CLIP
-    clip_logits = 100. * test_features @ clip_weights
+    clip_logits = 100. * test_features[:, :1024] @ clip_weights
     acc = cls_acc(clip_logits, test_labels)
     print("\n**** Zero-shot CLIP's test accuracy: {:.2f}. ****\n".format(acc))
 
@@ -43,7 +45,7 @@ def run_tip_adapter(cfg, cache_keys, cache_values, test_features, test_labels, c
     _ = search_hp(cfg, cache_keys, cache_values, test_features, test_labels, clip_weights)
 
 
-def run_tip_adapter_F(cfg, cache_keys, cache_values, test_features, test_labels, clip_weights, clip_model, train_loader_F):
+def run_tip_adapter_F(cfg, cache_keys, cache_values, test_features, test_labels, clip_weights, clip_model, train_loader_F, blip_model=None):
     
     # Enable the cached keys to be learnable
     adapter = nn.Linear(cache_keys.shape[0], cache_keys.shape[1], bias=False).to(clip_model.dtype).cuda()
@@ -67,10 +69,14 @@ def run_tip_adapter_F(cfg, cache_keys, cache_values, test_features, test_labels,
             with torch.no_grad():
                 image_features = clip_model.encode_image(images)
                 image_features /= image_features.norm(dim=-1, keepdim=True)
+                if blip_model:
+                    blip_img_features = blip_model(images, caption=None, mode='image')[:,0,:].squeeze().half()
+                    blip_img_features /= blip_img_features.norm(dim=-1, keepdim=True)
+                    image_features = torch.cat([image_features, blip_img_features], dim=1)
 
             affinity = adapter(image_features)
             cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
-            clip_logits = 100. * image_features @ clip_weights
+            clip_logits = 100. * image_features[:, :1024] @ clip_weights
             tip_logits = clip_logits + cache_logits * alpha
 
             loss = F.cross_entropy(tip_logits, target)
@@ -93,7 +99,7 @@ def run_tip_adapter_F(cfg, cache_keys, cache_values, test_features, test_labels,
 
         affinity = adapter(test_features)
         cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
-        clip_logits = 100. * test_features @ clip_weights
+        clip_logits = 100. * test_features[:, :1024] @ clip_weights
         tip_logits = clip_logits + cache_logits * alpha
         acc = cls_acc(tip_logits, test_labels)
 
@@ -112,53 +118,68 @@ def run_tip_adapter_F(cfg, cache_keys, cache_values, test_features, test_labels,
 
 def main():
 
-    # Load config file
-    args = get_arguments()
-    assert (os.path.exists(args.config))
-    
-    cfg = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
+    for shots in [8, 4, 2, 1]:
+        print(f'---------------------- {shots} shots -----------------------------')
 
-    cache_dir = os.path.join('./caches', cfg['dataset'])
-    os.makedirs(cache_dir, exist_ok=True)
-    cfg['cache_dir'] = cache_dir
+        # Load config file
+        args = get_arguments()
+        assert (os.path.exists(args.config))
+        
+        cfg = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
 
-    print("\nRunning configs.")
-    print(cfg, "\n")
+        cache_dir = os.path.join('./caches', cfg['dataset'])
+        os.makedirs(cache_dir, exist_ok=True)
+        cfg['cache_dir'] = cache_dir
 
-    # CLIP
-    clip_model, preprocess = clip.load(cfg['backbone'])
-    clip_model.eval()
+        print("\nRunning configs.")
+        print(cfg, "\n")
 
-    # ImageNet dataset
-    random.seed(1)
-    torch.manual_seed(1)
-    
-    print("Preparing ImageNet dataset.")
-    imagenet = ImageNet(cfg['root_path'], cfg['shots'], preprocess)
+        # CLIP
+        clip_model, preprocess = clip.load(cfg['backbone'])
+        clip_model.eval()
 
-    test_loader = torch.utils.data.DataLoader(imagenet.test, batch_size=64, num_workers=8, shuffle=False)
+        # ImageNet dataset
+        random.seed(1)
+        torch.manual_seed(1)
+        
+        print("Preparing ImageNet dataset.")
+        imagenet = ImageNet(cfg['root_path'], shots, preprocess)
 
-    train_loader_cache = torch.utils.data.DataLoader(imagenet.train, batch_size=256, num_workers=8, shuffle=False)
-    train_loader_F = torch.utils.data.DataLoader(imagenet.train, batch_size=256, num_workers=8, shuffle=True)
+        test_loader = torch.utils.data.DataLoader(imagenet.test, batch_size=64, num_workers=8, shuffle=False)
 
-    # Textual features
-    print("Getting textual features as CLIP's classifier.")
-    clip_weights = clip_classifier(imagenet.classnames, imagenet.template, clip_model)
+        train_loader_cache = torch.utils.data.DataLoader(imagenet.train, batch_size=256, num_workers=8, shuffle=False)
+        train_loader_F = torch.utils.data.DataLoader(imagenet.train, batch_size=256, num_workers=8, shuffle=True)
 
-    # Construct the cache model by few-shot training set
-    print("\nConstructing cache model by few-shot visual features and labels.")
-    cache_keys, cache_values = build_cache_model(cfg, clip_model, train_loader_cache)
+        # blip model initialization
+        blip_model = None
+        blip_weights = None
+        if args.use_blip:
+            model_url = './blip/model_large.pth'
+            blip_model = blip_feature_extractor(pretrained=model_url, image_size=224, vit='large')
+            blip_model.eval()
+            blip_model = blip_model.cuda()
+            # blip_weights = None
+            # blip_weights = blip_classifier(dataset.classnames, dataset.template, blip_model)
 
-    # Pre-load test features
-    print("\nLoading visual features and labels from test set.")
-    test_features, test_labels = pre_load_features(cfg, "test", clip_model, test_loader)
+        # Textual features
+        print("Getting textual features as CLIP's classifier.")
+        clip_weights = clip_classifier(imagenet.classnames, imagenet.template, clip_model, blip_model=None)
 
-    # ------------------------------------------ Tip-Adapter ------------------------------------------
-    run_tip_adapter(cfg, cache_keys, cache_values, test_features, test_labels, clip_weights)
+        # Construct the cache model by few-shot training set
+        print("\nConstructing cache model by few-shot visual features and labels.")
+        cache_keys, cache_values = build_cache_model(cfg, clip_model, train_loader_cache, blip_model=blip_model)
 
-    # ------------------------------------------ Tip-Adapter-F ------------------------------------------
-    run_tip_adapter_F(cfg, cache_keys, cache_values, test_features, test_labels, clip_weights, clip_model, train_loader_F)
-           
+        # Pre-load test features
+        print("\nLoading visual features and labels from test set.")
+        test_features, test_labels = pre_load_features(cfg, "test", clip_model, test_loader, blip_model=blip_model)
+
+        # ------------------------------------------ Tip-Adapter ------------------------------------------
+        run_tip_adapter(cfg, cache_keys, cache_values, test_features, test_labels, clip_weights)
+
+        # ------------------------------------------ Tip-Adapter-F ------------------------------------------
+        run_tip_adapter_F(cfg, cache_keys, cache_values, test_features, test_labels, clip_weights, clip_model, train_loader_F, blip_model=blip_model)
+            
+        print(f'---------------------- {shots} shots -----------------------------')
 
 if __name__ == '__main__':
     main()
