@@ -30,8 +30,8 @@ Check out the original <code>README.md</code> in [Tip-Adapter.md](https://github
 <tr>
 <td>Ours</td>
 <td>ImageNet</td>
-<td>-</td>
-<td>-</td>
+<td>60.84</td>
+<td>61.42</td>
 <td>62.37</td>
 <td>63.92</td>
 <td>66.40</td>
@@ -49,8 +49,8 @@ Check out the original <code>README.md</code> in [Tip-Adapter.md](https://github
 </tr>
 <td>Ours-F</td>
 <td>ImageNet</td>
-<td>-</td>
-<td>-</td>
+<td>61.80</td>
+<td>62.74</td>
 <td>65.07</td>
 <td>68.09</td>
 <td>71.22</td>
